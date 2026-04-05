@@ -64,8 +64,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('cast_vote', ({ roomId, vote }) => {
-    const user = rooms[roomId]?.users.find((u) => u.id === socket.id);
-    if (user) { user.vote = vote; io.to(roomId).emit('update_state', rooms[roomId]); }
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    if (!room || !user) return;
+
+    user.vote = vote;
+
+    if (shouldAutoReveal(room)) {
+      room.revealed = true;
+    }
+
+    io.to(roomId).emit('update_state', room);
   });
 
   socket.on('reveal', (roomId) => {
@@ -118,4 +127,10 @@ function removeUserFromRoom(roomId: string, socketId: string) {
   }
 
   io.to(roomId).emit('update_state', room);
+}
+
+function shouldAutoReveal(room: RoomState) {
+  const voters = room.users.filter((user) => user.role === 'voter');
+
+  return voters.length > 0 && voters.every((user) => user.vote !== null);
 }
