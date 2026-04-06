@@ -30,6 +30,7 @@ interface User {
   id: string;
   name: string;
   role: Role;
+  jobRole: string;
   vote: Vote;
 }
 
@@ -48,11 +49,28 @@ io.on('connection', (socket) => {
     callback(roomId);
   });
 
-  socket.on('join_room', ({ roomId, userName, role }) => {
+  socket.on('join_room', ({ roomId, userName, role, jobRole = '' }) => {
+    const normalizedUserName = userName.trim().toLowerCase();
+
+    if (!normalizedUserName) {
+      socket.emit('join_error', 'Please enter a name.');
+      return;
+    }
+
     socket.join(roomId);
     if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [] };
+    const duplicateNameExists = rooms[roomId].users.some((user) => (
+      user.id !== socket.id && user.name.trim().toLowerCase() === normalizedUserName
+    ));
+
+    if (duplicateNameExists) {
+      socket.leave(roomId);
+      socket.emit('join_error', 'That name is already in use for this room.');
+      return;
+    }
+
     rooms[roomId].users = rooms[roomId].users.filter((user) => user.id !== socket.id);
-    rooms[roomId].users.push({ id: socket.id, name: userName, role, vote: null });
+    rooms[roomId].users.push({ id: socket.id, name: userName, role, jobRole, vote: null });
     io.to(roomId).emit('update_state', rooms[roomId]);
   });
 
@@ -67,6 +85,7 @@ io.on('connection', (socket) => {
     const room = rooms[roomId];
     const user = room?.users.find((u) => u.id === socket.id);
     if (!room || !user) return;
+    if (!room.ticket.trim() || room.revealed) return;
 
     user.vote = vote;
 
@@ -78,7 +97,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('reveal', (roomId) => {
-    if (rooms[roomId]) { rooms[roomId].revealed = true; io.to(roomId).emit('update_state', rooms[roomId]); }
+    if (rooms[roomId]) {
+      rooms[roomId].revealed = true;
+      io.to(roomId).emit('update_state', rooms[roomId]);
+    }
   });
 
   // NEW: Next Ticket (Clears title and votes)
@@ -132,5 +154,5 @@ function removeUserFromRoom(roomId: string, socketId: string) {
 function shouldAutoReveal(room: RoomState) {
   const voters = room.users.filter((user) => user.role === 'voter');
 
-  return voters.length > 0 && voters.every((user) => user.vote !== null);
+  return voters.length > 0 && !room.revealed && voters.every((user) => user.vote !== null);
 }
