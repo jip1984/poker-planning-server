@@ -81,6 +81,33 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('update_profile', ({ roomId, userName, jobRole = '' }) => {
+    const room = rooms[roomId];
+    const user = room?.users.find((existingUser) => existingUser.id === socket.id);
+    const normalizedUserName = userName.trim().toLowerCase();
+
+    if (!room || !user) return;
+
+    if (!normalizedUserName) {
+      socket.emit('profile_update_error', 'Please enter a name.');
+      return;
+    }
+
+    const duplicateNameExists = room.users.some((existingUser) => (
+      existingUser.id !== socket.id && existingUser.name.trim().toLowerCase() === normalizedUserName
+    ));
+
+    if (duplicateNameExists) {
+      socket.emit('profile_update_error', 'That name is already in use for this room.');
+      return;
+    }
+
+    user.name = userName;
+    user.jobRole = jobRole;
+    socket.emit('profile_update_success');
+    io.to(roomId).emit('update_state', room);
+  });
+
   socket.on('cast_vote', ({ roomId, vote }) => {
     const room = rooms[roomId];
     const user = room?.users.find((u) => u.id === socket.id);
