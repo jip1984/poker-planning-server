@@ -22,6 +22,8 @@ const io = new Server(httpServer, {
 });
 const ROOM_ID_LENGTH = 6;
 const PORT = Number(process.env.PORT ?? 4000);
+const SCORE_VALUES = [1, 3, 5, 8, 13];
+const MIN_NAME_LENGTH = 3;
 
 type Role = 'host' | 'voter';
 type Vote = number | '?' | null;
@@ -34,10 +36,17 @@ interface User {
   vote: Vote;
 }
 
+interface TicketHistoryEntry {
+  ticket: string;
+  score: number | '?';
+  completedAt: string;
+}
+
 interface RoomState {
   ticket: string;
   revealed: boolean;
   users: User[];
+  history: TicketHistoryEntry[];
 }
 
 const rooms: Record<string, RoomState> = {};
@@ -45,7 +54,7 @@ const rooms: Record<string, RoomState> = {};
 io.on('connection', (socket) => {
   socket.on('create_room', (callback: (roomId: string) => void) => {
     const roomId = generateRoomId();
-    rooms[roomId] = { ticket: '', revealed: false, users: [] };
+    rooms[roomId] = { ticket: '', revealed: false, users: [], history: [] };
     callback(roomId);
   });
 
@@ -57,8 +66,13 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (normalizedUserName.length < MIN_NAME_LENGTH) {
+      socket.emit('join_error', `Name must be at least ${MIN_NAME_LENGTH} characters.`);
+      return;
+    }
+
     socket.join(roomId);
-    if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [] };
+    if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [], history: [] };
     const duplicateNameExists = rooms[roomId].users.some((user) => (
       user.id !== socket.id && user.name.trim().toLowerCase() === normalizedUserName
     ));
@@ -75,10 +89,21 @@ io.on('connection', (socket) => {
   });
 
   socket.on('update_ticket', ({ roomId, ticket }) => {
-    if (rooms[roomId]) {
-      rooms[roomId].ticket = ticket;
-      io.to(roomId).emit('update_state', rooms[roomId]);
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const normalizedTicket = normalizeTicket(ticket);
+    const duplicateTicketExists = normalizedTicket.length > 0 && room.history.some((entry) => (
+      normalizeTicket(entry.ticket) === normalizedTicket
+    ));
+
+    if (duplicateTicketExists) {
+      socket.emit('ticket_update_error', 'This ticket has already been estimated in this session.');
+      return;
     }
+
+    room.ticket = ticket;
+    io.to(roomId).emit('update_state', room);
   });
 
   socket.on('update_profile', ({ roomId, userName, jobRole = '' }) => {
@@ -90,6 +115,11 @@ io.on('connection', (socket) => {
 
     if (!normalizedUserName) {
       socket.emit('profile_update_error', 'Please enter a name.');
+      return;
+    }
+
+    if (normalizedUserName.length < MIN_NAME_LENGTH) {
+      socket.emit('profile_update_error', `Name must be at least ${MIN_NAME_LENGTH} characters.`);
       return;
     }
 
@@ -133,6 +163,12 @@ io.on('connection', (socket) => {
   // NEW: Next Ticket (Clears title and votes)
   socket.on('next_round', (roomId) => {
     if (rooms[roomId]) {
+      const historyEntry = buildHistoryEntry(rooms[roomId]);
+
+      if (historyEntry) {
+        rooms[roomId].history.unshift(historyEntry);
+      }
+
       rooms[roomId].ticket = '';
       rooms[roomId].revealed = false;
       rooms[roomId].users.forEach((u) => u.vote = null);
@@ -179,7 +215,61 @@ function removeUserFromRoom(roomId: string, socketId: string) {
 }
 
 function shouldAutoReveal(room: RoomState) {
-  const voters = room.users.filter((user) => user.role === 'voter');
+  const requiredVoters = room.users.filter((user) => (
+    user.role === 'voter' && normalizeJobRole(user.jobRole) !== 'observer'
+  ));
 
-  return voters.length > 0 && !room.revealed && voters.every((user) => user.vote !== null);
+  return requiredVoters.length > 0 && !room.revealed && requiredVoters.every((user) => user.vote !== null);
+}
+
+function buildHistoryEntry(room: RoomState): TicketHistoryEntry | null {
+  const ticket = room.ticket.trim();
+
+  if (!ticket) return null;
+
+  const score = calculateRoundScore(room);
+
+  if (score === null) return null;
+
+  return {
+    ticket,
+    score,
+    completedAt: new Date().toISOString(),
+  };
+}
+
+function calculateRoundScore(room: RoomState): number | '?' | null {
+  const submittedVotes = room.users
+    .map((user) => user.vote)
+    .filter((vote): vote is number | '?' => vote !== null);
+
+  if (!submittedVotes.length) return null;
+
+  if (submittedVotes.every((vote) => vote === '?')) {
+    return '?';
+  }
+
+  const numericVotes = room.users
+    .filter((user): user is User & { vote: number } => typeof user.vote === 'number')
+    .map((user) => user.vote)
+    .sort((a, b) => a - b);
+
+  if (!numericVotes.length) return '?';
+
+  const mid = Math.floor(numericVotes.length / 2);
+  const median = numericVotes.length % 2 !== 0
+    ? numericVotes[mid]!
+    : (numericVotes[mid - 1]! + numericVotes[mid]!) / 2;
+
+  return SCORE_VALUES.reduce((closest, current) => {
+    return Math.abs(current - median) < Math.abs(closest - median) ? current : closest;
+  }, SCORE_VALUES[0]!);
+}
+
+function normalizeTicket(ticket: string) {
+  return ticket.trim().toLowerCase();
+}
+
+function normalizeJobRole(jobRole: string) {
+  return jobRole.trim().toLowerCase();
 }
