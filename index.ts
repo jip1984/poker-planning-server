@@ -22,23 +22,29 @@ const io = new Server(httpServer, {
 });
 const ROOM_ID_LENGTH = 6;
 const PORT = Number(process.env.PORT ?? 4000);
-const SCORE_VALUES = [1, 3, 5, 8, 13];
 const MIN_NAME_LENGTH = 3;
 
 type Role = 'host' | 'voter';
-type Vote = number | '?' | null;
+type CardValue = number | string;
+
+interface CardSet {
+  name: string;
+  label: string;
+  cards: CardValue[];
+  scoreValues: number[];
+}
 
 interface User {
   id: string;
   name: string;
   role: Role;
   jobRole: string;
-  vote: Vote;
+  vote: CardValue | null;
 }
 
 interface TicketHistoryEntry {
   ticket: string;
-  score: number | '?';
+  score: CardValue;
   completedAt: string;
 }
 
@@ -47,14 +53,23 @@ interface RoomState {
   revealed: boolean;
   users: User[];
   history: TicketHistoryEntry[];
+  cardSet: CardSet;
+  autoReveal: boolean;
 }
+
+const DEFAULT_CARD_SET: CardSet = {
+  name: 'fibonacci',
+  label: 'Fibonacci',
+  cards: [1, 3, 5, 8, 13, '?'],
+  scoreValues: [1, 3, 5, 8, 13],
+};
 
 const rooms: Record<string, RoomState> = {};
 
 io.on('connection', (socket) => {
   socket.on('create_room', (callback: (roomId: string) => void) => {
     const roomId = generateRoomId();
-    rooms[roomId] = { ticket: '', revealed: false, users: [], history: [] };
+    rooms[roomId] = { ticket: '', revealed: false, users: [], history: [], cardSet: DEFAULT_CARD_SET, autoReveal: false };
     callback(roomId);
   });
 
@@ -72,7 +87,7 @@ io.on('connection', (socket) => {
     }
 
     socket.join(roomId);
-    if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [], history: [] };
+    if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [], history: [], cardSet: DEFAULT_CARD_SET, autoReveal: false };
     const duplicateNameExists = rooms[roomId].users.some((user) => (
       user.id !== socket.id && user.name.trim().toLowerCase() === normalizedUserName
     ));
@@ -144,10 +159,18 @@ io.on('connection', (socket) => {
     if (!room || !user) return;
     if (!room.ticket.trim() || room.revealed) return;
 
+    const isValidVote = vote === null || room.cardSet.cards.some((c) => String(c) === String(vote));
+    if (!isValidVote) return;
+
     user.vote = vote;
 
     if (shouldAutoReveal(room)) {
-      room.revealed = true;
+      if (room.autoReveal) {
+        room.revealed = true;
+      } else {
+        const host = room.users.find((u) => u.role === 'host');
+        if (host) io.to(host.id).emit('all_voted');
+      }
     }
 
     io.to(roomId).emit('update_state', room);
@@ -160,7 +183,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // NEW: Next Ticket (Clears title and votes)
   socket.on('next_round', (roomId) => {
     if (rooms[roomId]) {
       const historyEntry = buildHistoryEntry(rooms[roomId]);
@@ -174,6 +196,26 @@ io.on('connection', (socket) => {
       rooms[roomId].users.forEach((u) => u.vote = null);
       io.to(roomId).emit('update_state', rooms[roomId]);
     }
+  });
+
+  socket.on('update_card_set', ({ roomId, cardSet }: { roomId: string; cardSet: CardSet }) => {
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    if (!room || !user || user.role !== 'host') return;
+    if (room.revealed || room.ticket.trim()) return;
+    if (!cardSet?.cards?.length || cardSet.cards.length < 2) return;
+
+    room.cardSet = cardSet;
+    room.users.forEach((u) => u.vote = null);
+    io.to(roomId).emit('update_state', room);
+  });
+
+  socket.on('toggle_auto_reveal', (roomId: string) => {
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    if (!room || !user || user.role !== 'host') return;
+    room.autoReveal = !room.autoReveal;
+    io.to(roomId).emit('update_state', room);
   });
 
   socket.on('leave_room', (roomId) => {
@@ -238,14 +280,14 @@ function buildHistoryEntry(room: RoomState): TicketHistoryEntry | null {
   };
 }
 
-function calculateRoundScore(room: RoomState): number | '?' | null {
+function calculateRoundScore(room: RoomState): CardValue | null {
   const submittedVotes = room.users
     .map((user) => user.vote)
-    .filter((vote): vote is number | '?' => vote !== null);
+    .filter((vote): vote is CardValue => vote !== null);
 
   if (!submittedVotes.length) return null;
 
-  if (submittedVotes.every((vote) => vote === '?')) {
+  if (submittedVotes.every((vote) => String(vote) === '?')) {
     return '?';
   }
 
@@ -261,9 +303,12 @@ function calculateRoundScore(room: RoomState): number | '?' | null {
     ? numericVotes[mid]!
     : (numericVotes[mid - 1]! + numericVotes[mid]!) / 2;
 
-  return SCORE_VALUES.reduce((closest, current) => {
+  const scoreValues = room.cardSet.scoreValues;
+  if (!scoreValues.length) return '?';
+
+  return scoreValues.reduce((closest, current) => {
     return Math.abs(current - median) < Math.abs(closest - median) ? current : closest;
-  }, SCORE_VALUES[0]!);
+  }, scoreValues[0]!);
 }
 
 function normalizeTicket(ticket: string) {
