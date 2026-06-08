@@ -218,6 +218,22 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('update_state', room);
   });
 
+  socket.on('poke_voter', ({ roomId, targetId }: { roomId: string; targetId: string }) => {
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    if (!room || !user || user.role !== 'host') return;
+    io.to(targetId).emit('poked');
+  });
+
+  socket.on('poke_all', (roomId: string) => {
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    if (!room || !user || user.role !== 'host') return;
+    room.users
+      .filter((u) => u.role !== 'host' && u.vote === null && normalizeJobRole(u.jobRole) !== 'observer')
+      .forEach((u) => io.to(u.id).emit('poked'));
+  });
+
   socket.on('leave_room', (roomId) => {
     removeUserFromRoom(roomId, socket.id);
     socket.leave(roomId);
