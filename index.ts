@@ -14,15 +14,38 @@ app.use(cors({
   credentials: true,
 }));
 const httpServer = createServer(app);
+// How long a dropped user keeps their seat (and vote) before being removed.
+const DISCONNECT_GRACE_MS = 30_000;
+
 const io = new Server(httpServer, {
   cors: {
     origin: CLIENT_ORIGINS,
     credentials: true,
   },
+  // Lets a briefly dropped socket come back with the same id and rooms,
+  // and replays any events it missed.
+  connectionStateRecovery: {
+    maxDisconnectionDuration: DISCONNECT_GRACE_MS,
+  },
 });
 const ROOM_ID_LENGTH = 6;
 const PORT = Number(process.env.PORT ?? 4000);
 const MIN_NAME_LENGTH = 3;
+const MAX_NAME_LENGTH = 40;
+const MAX_JOB_ROLE_LENGTH = 30;
+const MAX_TICKET_LENGTH = 200;
+const MAX_CARDS = 12;
+const MAX_CARD_VALUE = 999;
+const MAX_CARD_SET_LABEL_LENGTH = 40;
+
+// Server-only: who created each room. Only that browser tab may join as host.
+const roomCreators = new Map<string, { socketId: string; clientId: string | null }>();
+
+// Server-only: socket id -> the browser tab's stable client id. Kept out of
+// RoomState so it's never broadcast to other users.
+const clientIdBySocket = new Map<string, string>();
+// Socket id -> timer that removes the user once the grace period ends.
+const pendingRemovals = new Map<string, ReturnType<typeof setTimeout>>();
 
 type Role = 'host' | 'voter';
 type CardValue = number | string;
@@ -67,29 +90,53 @@ const DEFAULT_CARD_SET: CardSet = {
 const rooms: Record<string, RoomState> = {};
 
 io.on('connection', (socket) => {
+  // The room, but only if this socket is its host.
+  const roomIfHost = (roomId: unknown) => {
+    if (typeof roomId !== 'string') return null;
+    const room = rooms[roomId];
+    const user = room?.users.find((u) => u.id === socket.id);
+    return room && user?.role === 'host' ? room : null;
+  };
+
   socket.on('create_room', (callback: (roomId: string) => void) => {
+    if (typeof callback !== 'function') return;
     const roomId = generateRoomId();
     rooms[roomId] = { ticket: '', revealed: false, users: [], history: [], cardSet: DEFAULT_CARD_SET, autoReveal: false };
+    roomCreators.set(roomId, { socketId: socket.id, clientId: null });
     callback(roomId);
   });
 
-  socket.on('join_room', ({ roomId, userName, role, jobRole = '' }) => {
-    const normalizedUserName = userName.trim().toLowerCase();
+  if (socket.recovered) cancelPendingRemoval(socket.id);
 
-    if (!normalizedUserName) {
-      socket.emit('join_error', 'Please enter a name.');
+  socket.on('join_room', (payload) => {
+    const { roomId, userName, role, jobRole, clientId } = payload ?? {};
+    if (typeof roomId !== 'string' || typeof userName !== 'string') return;
+    const nameError = validateName(userName);
+    if (nameError) {
+      socket.emit('join_error', nameError);
       return;
     }
+    const normalizedUserName = userName.trim().toLowerCase();
+    const cleanJobRole = cleanText(jobRole, MAX_JOB_ROLE_LENGTH);
 
-    if (normalizedUserName.length < MIN_NAME_LENGTH) {
-      socket.emit('join_error', `Name must be at least ${MIN_NAME_LENGTH} characters.`);
+    // Rooms only come from create_room; don't let a join invent one.
+    const room = rooms[roomId];
+    if (!room) {
+      socket.emit('join_error', 'This room no longer exists. Ask the host for a new link.');
       return;
     }
 
     socket.join(roomId);
-    if (!rooms[roomId]) rooms[roomId] = { ticket: '', revealed: false, users: [], history: [], cardSet: DEFAULT_CARD_SET, autoReveal: false };
-    const duplicateNameExists = rooms[roomId].users.some((user) => (
-      user.id !== socket.id && user.name.trim().toLowerCase() === normalizedUserName
+    const validClientId = typeof clientId === 'string' && clientId.length > 0 && clientId.length <= 100 ? clientId : null;
+    if (validClientId) clientIdBySocket.set(socket.id, validClientId);
+
+    // Same socket, or the same browser tab coming back on a new socket.
+    const existingUser = room.users.find((user) => (
+      user.id === socket.id || (validClientId !== null && clientIdBySocket.get(user.id) === validClientId)
+    ));
+
+    const duplicateNameExists = room.users.some((user) => (
+      user !== existingUser && user.name.trim().toLowerCase() === normalizedUserName
     ));
 
     if (duplicateNameExists) {
@@ -98,14 +145,55 @@ io.on('connection', (socket) => {
       return;
     }
 
-    rooms[roomId].users = rooms[roomId].users.filter((user) => user.id !== socket.id);
-    rooms[roomId].users.push({ id: socket.id, name: userName, role, jobRole, vote: null });
-    io.to(roomId).emit('update_state', rooms[roomId]);
+    if (existingUser) {
+      // Rejoin: keep their seat, role and vote, move them onto this socket.
+      const oldSocketId = existingUser.id;
+      if (oldSocketId !== socket.id) {
+        cancelPendingRemoval(oldSocketId);
+        clientIdBySocket.delete(oldSocketId);
+        io.sockets.sockets.get(oldSocketId)?.leave(roomId);
+      }
+      existingUser.id = socket.id;
+      existingUser.name = userName;
+      existingUser.jobRole = cleanJobRole;
+      if (isObserver(existingUser)) existingUser.vote = null;
+    } else {
+      let assignedRole: Role = 'voter';
+
+      if (role === 'host') {
+        // Only the tab that created the room may be host, and only one at a time.
+        const creator = roomCreators.get(roomId);
+        const isCreator = creator !== undefined && (
+          creator.socketId === socket.id || (validClientId !== null && creator.clientId === validClientId)
+        );
+        const hasHost = room.users.some((u) => u.role === 'host');
+
+        if (!isCreator || hasHost) {
+          socket.leave(roomId);
+          socket.emit('join_error', 'Only the person who created this room can join as host.');
+          return;
+        }
+
+        creator.socketId = socket.id;
+        creator.clientId = validClientId;
+        assignedRole = 'host';
+      }
+
+      room.users.push({ id: socket.id, name: userName, role: assignedRole, jobRole: cleanJobRole, vote: null });
+    }
+
+    io.to(roomId).emit('update_state', room);
   });
 
-  socket.on('update_ticket', ({ roomId, ticket }) => {
-    const room = rooms[roomId];
-    if (!room) return;
+  socket.on('update_ticket', (payload) => {
+    const { roomId, ticket } = payload ?? {};
+    const room = roomIfHost(roomId);
+    if (!room || typeof ticket !== 'string') return;
+
+    if (ticket.length > MAX_TICKET_LENGTH) {
+      socket.emit('ticket_update_error', `Ticket must be ${MAX_TICKET_LENGTH} characters or fewer.`);
+      return;
+    }
 
     const normalizedTicket = normalizeTicket(ticket);
     const duplicateTicketExists = normalizedTicket.length > 0 && room.history.some((entry) => (
@@ -121,22 +209,19 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('update_state', room);
   });
 
-  socket.on('update_profile', ({ roomId, userName, jobRole = '' }) => {
+  socket.on('update_profile', (payload) => {
+    const { roomId, userName, jobRole } = payload ?? {};
+    if (typeof roomId !== 'string' || typeof userName !== 'string') return;
     const room = rooms[roomId];
     const user = room?.users.find((existingUser) => existingUser.id === socket.id);
-    const normalizedUserName = userName.trim().toLowerCase();
-
     if (!room || !user) return;
 
-    if (!normalizedUserName) {
-      socket.emit('profile_update_error', 'Please enter a name.');
+    const nameError = validateName(userName);
+    if (nameError) {
+      socket.emit('profile_update_error', nameError);
       return;
     }
-
-    if (normalizedUserName.length < MIN_NAME_LENGTH) {
-      socket.emit('profile_update_error', `Name must be at least ${MIN_NAME_LENGTH} characters.`);
-      return;
-    }
+    const normalizedUserName = userName.trim().toLowerCase();
 
     const duplicateNameExists = room.users.some((existingUser) => (
       existingUser.id !== socket.id && existingUser.name.trim().toLowerCase() === normalizedUserName
@@ -148,85 +233,94 @@ io.on('connection', (socket) => {
     }
 
     user.name = userName;
-    user.jobRole = jobRole;
+    user.jobRole = cleanText(jobRole, MAX_JOB_ROLE_LENGTH);
+    // Observers watch only: switching to Observer drops any vote already cast.
+    if (isObserver(user)) user.vote = null;
     socket.emit('profile_update_success');
+    // Losing a pending voter can mean everyone left has now voted.
+    handleAllVoted(room);
     io.to(roomId).emit('update_state', room);
   });
 
-  socket.on('cast_vote', ({ roomId, vote }) => {
+  socket.on('cast_vote', (payload) => {
+    const { roomId, vote } = payload ?? {};
+    if (typeof roomId !== 'string') return;
     const room = rooms[roomId];
     const user = room?.users.find((u) => u.id === socket.id);
     if (!room || !user) return;
     if (!room.ticket.trim() || room.revealed) return;
+    if (isObserver(user)) return; // observers watch only
 
-    const isValidVote = vote === null || room.cardSet.cards.some((c) => String(c) === String(vote));
-    if (!isValidVote) return;
+    // Store the card's own value so "5" and 5 can't both end up in the votes.
+    const card = room.cardSet.cards.find((c) => String(c) === String(vote));
+    if (vote !== null && card === undefined) return;
 
-    user.vote = vote;
-
-    if (shouldAutoReveal(room)) {
-      if (room.autoReveal) {
-        room.revealed = true;
-      } else {
-        const host = room.users.find((u) => u.role === 'host');
-        if (host) io.to(host.id).emit('all_voted');
-      }
-    }
-
+    user.vote = vote === null ? null : card!;
+    handleAllVoted(room);
     io.to(roomId).emit('update_state', room);
   });
 
   socket.on('reveal', (roomId) => {
-    if (rooms[roomId]) {
-      rooms[roomId].revealed = true;
-      io.to(roomId).emit('update_state', rooms[roomId]);
-    }
+    const room = roomIfHost(roomId);
+    if (!room) return;
+    room.revealed = true;
+    io.to(roomId).emit('update_state', room);
   });
 
   socket.on('next_round', (roomId) => {
-    if (rooms[roomId]) {
-      const historyEntry = buildHistoryEntry(rooms[roomId]);
+    const room = roomIfHost(roomId);
+    if (!room) return;
 
-      if (historyEntry) {
-        rooms[roomId].history.unshift(historyEntry);
-      }
+    const historyEntry = buildHistoryEntry(room);
+    if (historyEntry) room.history.unshift(historyEntry);
 
-      rooms[roomId].ticket = '';
-      rooms[roomId].revealed = false;
-      rooms[roomId].users.forEach((u) => u.vote = null);
-      io.to(roomId).emit('update_state', rooms[roomId]);
-    }
-  });
-
-  socket.on('update_card_set', ({ roomId, cardSet }: { roomId: string; cardSet: CardSet }) => {
-    const room = rooms[roomId];
-    const user = room?.users.find((u) => u.id === socket.id);
-    if (!room || !user || user.role !== 'host') return;
-    if (room.revealed || room.ticket.trim()) return;
-    if (!cardSet?.cards?.length || cardSet.cards.length < 2) return;
-
-    room.cardSet = cardSet;
+    room.ticket = '';
+    room.revealed = false;
     room.users.forEach((u) => u.vote = null);
     io.to(roomId).emit('update_state', room);
   });
 
-  socket.on('toggle_auto_reveal', (roomId: string) => {
-    const room = rooms[roomId];
-    const user = room?.users.find((u) => u.id === socket.id);
-    if (!room || !user || user.role !== 'host') return;
+  socket.on('update_card_set', (payload) => {
+    const { roomId, cardSet } = payload ?? {};
+    const room = roomIfHost(roomId);
+    if (!room) return;
+    if (room.revealed || room.ticket.trim()) return;
+
+    const cleanCardSet = sanitizeCardSet(cardSet);
+    if (!cleanCardSet) return;
+
+    room.cardSet = cleanCardSet;
+    room.users.forEach((u) => u.vote = null);
+    io.to(roomId).emit('update_state', room);
+  });
+
+  socket.on('toggle_auto_reveal', (roomId) => {
+    const room = roomIfHost(roomId);
+    if (!room) return;
     room.autoReveal = !room.autoReveal;
     io.to(roomId).emit('update_state', room);
   });
 
   socket.on('leave_room', (roomId) => {
+    if (typeof roomId !== 'string') return;
+    cancelPendingRemoval(socket.id);
     removeUserFromRoom(roomId, socket.id);
     socket.leave(roomId);
   });
 
-  socket.on('disconnect', () => {
-    for (const rid in rooms) {
-      removeUserFromRoom(rid, socket.id);
+  socket.on('disconnect', (reason) => {
+    // The client closed the socket on purpose: remove them now.
+    if (reason === 'client namespace disconnect') {
+      removeUserEverywhere(socket.id);
+      return;
     }
+
+    // Network drop, sleep, refresh: hold their seat so they can rejoin.
+    cancelPendingRemoval(socket.id);
+    pendingRemovals.set(socket.id, setTimeout(() => {
+      pendingRemovals.delete(socket.id);
+      removeUserEverywhere(socket.id);
+    }, DISCONNECT_GRACE_MS));
   });
 });
 
@@ -242,6 +336,19 @@ function generateRoomId() {
   return roomId;
 }
 
+function cancelPendingRemoval(socketId: string) {
+  const timer = pendingRemovals.get(socketId);
+  if (timer) clearTimeout(timer);
+  pendingRemovals.delete(socketId);
+}
+
+function removeUserEverywhere(socketId: string) {
+  for (const rid in rooms) {
+    removeUserFromRoom(rid, socketId);
+  }
+  clientIdBySocket.delete(socketId);
+}
+
 function removeUserFromRoom(roomId: string, socketId: string) {
   const room = rooms[roomId];
   if (!room) return;
@@ -250,15 +357,32 @@ function removeUserFromRoom(roomId: string, socketId: string) {
 
   if (room.users.length === 0) {
     delete rooms[roomId];
+    roomCreators.delete(roomId);
     return;
   }
 
   io.to(roomId).emit('update_state', room);
 }
 
+function isObserver(user: User) {
+  return normalizeJobRole(user.jobRole) === 'observer';
+}
+
+/** Once every voter has voted: reveal (auto-reveal on) or tell the host. */
+function handleAllVoted(room: RoomState) {
+  if (!shouldAutoReveal(room)) return;
+
+  if (room.autoReveal) {
+    room.revealed = true;
+  } else {
+    const host = room.users.find((u) => u.role === 'host');
+    if (host) io.to(host.id).emit('all_voted');
+  }
+}
+
 function shouldAutoReveal(room: RoomState) {
   const requiredVoters = room.users.filter((user) => (
-    user.role === 'voter' && normalizeJobRole(user.jobRole) !== 'observer'
+    user.role === 'voter' && !isObserver(user)
   ));
 
   return requiredVoters.length > 0 && !room.revealed && requiredVoters.every((user) => user.vote !== null);
@@ -309,6 +433,45 @@ function calculateRoundScore(room: RoomState): CardValue | null {
   return scoreValues.reduce((closest, current) => {
     return Math.abs(current - median) < Math.abs(closest - median) ? current : closest;
   }, scoreValues[0]!);
+}
+
+function validateName(userName: string): string | null {
+  const trimmed = userName.trim();
+  if (!trimmed) return 'Please enter a name.';
+  if (trimmed.length < MIN_NAME_LENGTH) return `Name must be at least ${MIN_NAME_LENGTH} characters.`;
+  if (userName.length > MAX_NAME_LENGTH) return `Name must be ${MAX_NAME_LENGTH} characters or fewer.`;
+  return null;
+}
+
+// Any non-string becomes '', and long strings are cut to maxLength.
+function cleanText(value: unknown, maxLength: number) {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+}
+
+// Rebuilds a card set from client input. Cards must be '?' or a number
+// from 0 to MAX_CARD_VALUE; score values are derived here, not trusted.
+function sanitizeCardSet(input: unknown): CardSet | null {
+  if (!input || typeof input !== 'object') return null;
+  const { name, label, cards } = input as Record<string, unknown>;
+  if (!Array.isArray(cards) || cards.length < 2 || cards.length > MAX_CARDS) return null;
+
+  const cleanCards: CardValue[] = [];
+  for (const card of cards) {
+    if (card === '?') {
+      cleanCards.push('?');
+    } else if (typeof card === 'number' && Number.isFinite(card) && card >= 0 && card <= MAX_CARD_VALUE) {
+      cleanCards.push(card);
+    } else {
+      return null;
+    }
+  }
+
+  return {
+    name: cleanText(name, MAX_CARD_SET_LABEL_LENGTH) || 'custom',
+    label: cleanText(label, MAX_CARD_SET_LABEL_LENGTH) || 'Custom',
+    cards: cleanCards,
+    scoreValues: cleanCards.filter((card): card is number => typeof card === 'number'),
+  };
 }
 
 function normalizeTicket(ticket: string) {
